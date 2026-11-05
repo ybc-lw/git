@@ -1,0 +1,376 @@
+name: Build static Git for Linux (musl)
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: x86_64 Linux musl
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(git describe --tags --always)"
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare build script
+        shell: bash
+        run: |
+          rm -rf dist
+          mkdir -p dist
+          cat > "$RUNNER_TEMP/build.sh" <<'BUILD'
+          #!/bin/sh
+          set -eu
+
+          : "${GIT_VERSION:?GIT_VERSION is required}"
+
+          ROOT=/tmp/git-root
+          PREFIX=/usr/local
+          GIT_EXEC_PATH="$PREFIX/libexec/git-core"
+          IDN2_LIB=/tmp/idn2-fixed/libidn2.a
+          MAX_SIZE=31457280
+
+          # Start from a clean build environment.
+          rm -rf "$ROOT" /tmp/idn2-fixed /tmp/git-test
+          mkdir -p "$ROOT"
+
+          # Install build dependencies and static libraries.
+          apk add --no-cache \
+            build-base \
+            linux-headers \
+            curl-dev \
+            curl-static \
+            openssl-dev \
+            openssl-libs-static \
+            zlib-dev \
+            zlib-static \
+            expat-dev \
+            expat-static \
+            pcre2-dev \
+            pcre2-static \
+            zstd-dev \
+            zstd-static \
+            brotli-dev \
+            brotli-static \
+            nghttp2-dev \
+            nghttp2-static \
+            libidn2-dev \
+            libidn2-static \
+            libpsl-dev \
+            libpsl-static \
+            libunistring-dev \
+            libunistring-static \
+            pkgconf \
+            ca-certificates \
+            coreutils \
+            xz \
+            cargo
+
+          # Verify all required static libraries.
+          for lib in \
+            curl \
+            cares \
+            nghttp2 \
+            idn2 \
+            psl \
+            ssl \
+            crypto \
+            zstd \
+            brotlidec \
+            brotlicommon \
+            z \
+            expat \
+            unistring
+          do
+            test -s "/usr/lib/lib${lib}.a"
+          done
+
+          cd /src
+
+          # Rename libidn2's error symbol to avoid a collision
+          # with Git's own error() symbol.
+          mkdir -p /tmp/idn2-fixed
+          objcopy \
+            --redefine-sym error=idn2_error \
+            /usr/lib/libidn2.a \
+            "$IDN2_LIB"
+          ranlib "$IDN2_LIB"
+
+          # Build flags.
+          export CFLAGS="-Os -pipe -ffunction-sections -fdata-sections"
+          export LDFLAGS="-static -Wl,--gc-sections"
+
+          # Get static curl dependencies.
+          # Use the patched libidn2 archive.
+          CURL_LDFLAGS="$(
+            curl-config --static-libs |
+            sed "s|-lidn2|$IDN2_LIB|g"
+          ) -lbrotlicommon -lunistring"
+          export CURL_LDFLAGS
+
+          # Shared Make configuration.
+          set -- \
+            prefix="$PREFIX" \
+            libexecdir="$PREFIX/libexec" \
+            gitexecdir="$GIT_EXEC_PATH" \
+            NO_PERL=YesPlease \
+            NO_TCLTK=YesPlease \
+            NO_GETTEXT=YesPlease \
+            NO_REGEX=NeedsStartEnd \
+            USE_LIBPCRE2=YesPlease
+
+          # Compile Git.
+          make -j"$(nproc)" \
+            "$@" \
+            CURL_LDFLAGS="$CURL_LDFLAGS" \
+            LDFLAGS="$LDFLAGS" \
+            all
+
+          # Install Git into an isolated directory.
+          make \
+            "$@" \
+            CURL_LDFLAGS="$CURL_LDFLAGS" \
+            LDFLAGS="$LDFLAGS" \
+            install \
+            DESTDIR="$ROOT"
+
+          # Remove documentation.
+          rm -rf \
+            "$ROOT$PREFIX/share/man" \
+            "$ROOT$PREFIX/share/doc" \
+            "$ROOT$PREFIX/share/info"
+
+          # Remove optional standalone programs that are not needed
+          # for a normal Git client installation.
+          #
+          # These include server-side programs, legacy HTTP helpers,
+          # IMAP sending, and the separate Scalar executable.
+          rm -f \
+            "$ROOT$GIT_EXEC_PATH/git-daemon" \
+            "$ROOT$GIT_EXEC_PATH/git-http-backend" \
+            "$ROOT$GIT_EXEC_PATH/git-imap-send" \
+            "$ROOT$GIT_EXEC_PATH/git-http-fetch" \
+            "$ROOT$GIT_EXEC_PATH/git-http-push" \
+            "$ROOT$PREFIX/bin/scalar"
+
+          # Remove commands that depend on optional Perl/Python
+          # integrations or external web-browser helpers.
+          rm -f \
+            "$ROOT$PREFIX/bin/git-cvsserver" \
+            "$ROOT$GIT_EXEC_PATH/git-archimport" \
+            "$ROOT$GIT_EXEC_PATH/git-cvsimport" \
+            "$ROOT$GIT_EXEC_PATH/git-cvsserver" \
+            "$ROOT$GIT_EXEC_PATH/git-send-email" \
+            "$ROOT$GIT_EXEC_PATH/git-svn" \
+            "$ROOT$GIT_EXEC_PATH/git-p4" \
+            "$ROOT$GIT_EXEC_PATH/git-instaweb" \
+            "$ROOT$GIT_EXEC_PATH/git-web--browse"
+
+          # Include a CA certificate bundle in the distributable tree.
+          # This allows HTTPS certificate verification on systems
+          # that do not already provide the Alpine CA bundle path.
+          test -s /etc/ssl/cert.pem
+          mkdir -p "$ROOT/etc/ssl"
+          cp -L /etc/ssl/cert.pem "$ROOT/etc/ssl/cert.pem"
+
+          # Strip ELF files only; leave scripts and data untouched.
+          find "$ROOT$PREFIX" -type f -exec sh -c '
+            for f do
+              if readelf -h "$f" >/dev/null 2>&1; then
+                strip --strip-unneeded "$f"
+              fi
+            done
+          ' sh {} +
+
+          # Configure the installed Git.
+          export PATH="$ROOT$PREFIX/bin:$PATH"
+          export GIT_EXEC_PATH="$ROOT$GIT_EXEC_PATH"
+          export GIT_TEMPLATE_DIR="$ROOT$PREFIX/share/git-core/templates"
+
+          # Basic executable checks.
+          test -x "$ROOT$PREFIX/bin/git"
+          test -x "$ROOT$PREFIX/bin/git-shell"
+          git --version
+          git --exec-path
+
+          # Required Git transport helpers.
+          for helper in \
+            git-remote-http \
+            git-remote-https \
+            git-upload-pack \
+            git-receive-pack \
+            git-upload-archive \
+            git-shell
+          do
+            test -x "$GIT_EXEC_PATH/$helper"
+          done
+
+          # Ensure optional standalone programs were removed.
+          for helper in \
+            git-daemon \
+            git-http-backend \
+            git-imap-send \
+            git-http-fetch \
+            git-http-push
+          do
+            test ! -e "$GIT_EXEC_PATH/$helper"
+          done
+
+          test ! -e "$ROOT$PREFIX/bin/scalar"
+
+          # Test local Git functionality.
+          mkdir -p /tmp/git-test
+          cd /tmp/git-test
+
+          git config --global init.defaultBranch main
+          git init repo
+
+          cd repo
+
+          git config user.name "Git Build Test"
+          git config user.email "test@example.invalid"
+
+          echo "Hello Git" > README
+          echo "pcre2-test" > pcre2-test.txt
+
+          git add README pcre2-test.txt
+          git commit -m "Initial commit"
+          git status
+
+          git branch test
+          git worktree add ../worktree test
+          git bundle create ../test.bundle --all
+          git fsck --full
+          git clone ../test.bundle ../clone
+
+          # Verify PCRE2 support.
+          git grep -P 'pcre2-(test)' -- pcre2-test.txt
+
+          # Test HTTPS transport.
+          git ls-remote https://github.com/git/git.git HEAD
+
+          # Test SSH command delegation without requiring credentials.
+          cat > /tmp/ssh-probe <<'SSH'
+          #!/bin/sh
+          printf '%s\n' "$@" > /tmp/ssh-probe-args
+          exit 97
+          SSH
+
+          chmod +x /tmp/ssh-probe
+
+          if GIT_SSH_COMMAND=/tmp/ssh-probe \
+            git ls-remote git@example.invalid:repo.git
+          then
+            echo "Unexpected SSH success"
+            exit 1
+          fi
+
+          test -s /tmp/ssh-probe-args
+
+          # Verify that installed executable ELF files are static.
+          find "$ROOT$PREFIX" -type f -exec sh -c '
+            for f do
+              if [ -x "$f" ] &&
+                 readelf -h "$f" >/dev/null 2>&1
+              then
+                if readelf -l "$f" | grep -q INTERP; then
+                  echo "Dynamic executable: $f"
+                  exit 1
+                fi
+
+                if readelf -d "$f" 2>/dev/null |
+                   grep -q NEEDED
+                then
+                  echo "Dynamic dependency: $f"
+                  exit 1
+                fi
+              fi
+            done
+          ' sh {} +
+
+          # Build information.
+          cat > "$ROOT/BUILD-INFO.txt" <<EOF
+          Git source: $GIT_VERSION
+          Architecture: x86_64
+          libc: musl
+          Linkage: static
+          Installation prefix: /usr/local
+          Perl: disabled
+          Tcl/Tk: disabled
+          GUI: disabled
+          Gettext: disabled
+          PCRE2: enabled
+          HTTPS: static libcurl
+          SSH: external ssh client
+          CA certificates: included
+          Git daemon: omitted
+          HTTP backend: omitted
+          Scalar: omitted
+          Maximum installed size: 30 MiB
+          EOF
+
+          # Check the final installed tree size.
+          SIZE=$(du -sb "$ROOT" | cut -f1)
+          echo "Installed size: $SIZE bytes"
+
+          if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+            echo "ERROR: Git exceeds the 30 MiB installed-size limit"
+            echo "Largest directory entries:"
+            du -ak "$ROOT" | sort -n | tail -30
+            exit 1
+          fi
+
+          # Create the distributable archive.
+          mkdir -p /dist
+          ARCHIVE="/dist/git-$GIT_VERSION-x86_64-linux-musl.tar.xz"
+
+          tar -cJf "$ARCHIVE" -C "$ROOT" .
+
+          # Generate checksums.
+          cd /dist
+
+          sha256sum \
+            "git-$GIT_VERSION-x86_64-linux-musl.tar.xz" \
+            > SHA256SUMS
+
+          echo "=== Distribution files ==="
+          ls -lh *
+          BUILD
+
+      - name: Build
+        env:
+          GIT_VERSION: ${{ steps.version.outputs.value }}
+        shell: bash
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            -e GIT_VERSION="$GIT_VERSION" \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -v "$GITHUB_WORKSPACE/dist:/dist" \
+            -v "$RUNNER_TEMP/build.sh:/tmp/build.sh:ro" \
+            alpine:3.22 \
+            sh /tmp/build.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-${{ steps.version.outputs.value }}-x86_64-linux-musl
+          path: |
+            dist/*.tar.xz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
